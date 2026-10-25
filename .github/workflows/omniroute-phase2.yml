@@ -1,0 +1,91 @@
+name: OmniRoute phase 2 packaged-runtime safety audit
+
+on:
+  push:
+    branches:
+      - experiment/omniroute-net-isolation
+    paths:
+      - .github/workflows/omniroute-phase2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-runtime-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      npm_config_audit: "false"
+      npm_config_fund: "false"
+      npm_config_ignore_scripts: "true"
+    steps:
+      - name: Download pinned artifact on runner (outside test sandbox)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/omni-audit"
+          cd "$RUNNER_TEMP/omni-audit"
+          npm pack omniroute@3.8.52 --ignore-scripts --pack-destination . --silent
+          test -f omniroute-3.8.52.tgz
+          echo "Package SHA256:"
+          sha256sum omniroute-3.8.52.tgz
+          mkdir package
+          tar -xzf omniroute-3.8.52.tgz -C package --strip-components=1
+          test -f package/dist/server.js
+          test -d package/dist/.build/next/server/app/api
+      - name: Preflight Docker runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull node:22-bookworm-slim
+      - name: Audit actual packaged runtime offline (no service startup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --cap-drop ALL \
+            --security-opt no-new-privileges --read-only \
+            --tmpfs /tmp:rw,nosuid,size=32m \
+            --user 1000:1000 \
+            -v "$RUNNER_TEMP/omni-audit/package:/audit:ro" \
+            node:22-bookworm-slim node -e '
+              const fs = require("fs"), path = require("path"), os = require("os");
+              const interfaces = Object.keys(os.networkInterfaces());
+              if (interfaces.some(n => n !== "lo")) throw Error("Non-loopback network interface found");
+              const pkg = JSON.parse(fs.readFileSync("/audit/package.json","utf8"));
+              if (pkg.version !== "3.8.52") throw Error("Unexpected OmniRoute version");
+              const root = "/audit/dist";
+              let files = [], bytes = 0;
+              function walk(dir) {
+                for (const e of fs.readdirSync(dir, {withFileTypes:true})) {
+                  const f = path.join(dir,e.name);
+                  if (e.isSymbolicLink()) throw Error("Unexpected symbolic link: " + f);
+                  if (e.isDirectory()) walk(f);
+                  else if (e.isFile() && /\.(js|mjs|cjs)$/.test(e.name)) {
+                    files.push(f); bytes += fs.statSync(f).size;
+                  }
+                }
+              }
+              walk(root);
+              const needles = [
+                "api64.ipify.org", "api4.ipify.org",
+                "registry.npmjs.org", "api.github.com",
+                "waitForCooldown", "globalFallbackModel",
+                "OMNIROUTE_NO_UPDATE_NOTIFIER"
+              ];
+              const hits = Object.fromEntries(needles.map(n => [n, []]));
+              for (const f of files) {
+                const s = fs.readFileSync(f,"utf8");
+                for (const n of needles) if (s.includes(n)) hits[n].push(path.relative("/audit",f));
+              }
+              console.log(JSON.stringify({package:pkg.name,version:pkg.version,
+                inspected_js_files:files.length,bytes,hits},null,2));
+              if (!files.length) throw Error("No runtime JS files inspected");
+              console.log("PASS: Offline static audit completed; no OmniRoute service was launched.");
+              console.log("GATE: No patched runtime is approved by this audit.");
+            '
+      - name: Enforce no-promotion boundary
+        shell: bash
+        run: |
+          echo "This workflow only audits the packaged runtime in a no-network container."
+          echo "No patch, local inference, credentials, FreeLLMAPI connection, deployment, or MCP registration."
