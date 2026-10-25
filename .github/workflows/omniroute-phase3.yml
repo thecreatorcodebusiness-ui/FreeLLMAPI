@@ -1,0 +1,64 @@
+name: OmniRoute phase 3 source and isolated route checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [experiment/omniroute-phase3]
+    paths:
+      - .github/workflows/omniroute-phase3.yml
+      - omniroute-phase3.patch
+
+permissions:
+  contents: read
+
+jobs:
+  source-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4
+      - name: Fetch exact OmniRoute source and apply reviewed diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v3.8.52 https://github.com/cheaper-inference/OmniRoute.git "$RUNNER_TEMP/omniroute"
+          test "$(git -C "$RUNNER_TEMP/omniroute" rev-parse HEAD)" = ad6f33f66bda34eba98645d3bfdabbde294bc843
+          git -C "$RUNNER_TEMP/omniroute" apply --check "$GITHUB_WORKSPACE/omniroute-phase3.patch"
+          git -C "$RUNNER_TEMP/omniroute" apply "$GITHUB_WORKSPACE/omniroute-phase3.patch"
+      - name: Prepare dependencies and rebuild actual Next runtime
+        shell: bash
+        working-directory: ${{ runner.temp }}/omniroute
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          test -f dist/server.js
+          test -f dist/.build/next/server/app/api/v1/chat/completions/route.js
+          rg -l 'OMNIROUTE_STRICT_OFFLINE|strictOfflineChat' dist/.build/next/server/app/api/v1/chat/completions
+      - name: Run route tests in kernel-isolated container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull node:22-alpine
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            node:22-alpine node -e 'const n=Object.keys(require("os").networkInterfaces());if(n.some(x=>x!=="lo"))process.exit(1);console.log("loopback-only",n)'
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            --read-only --tmpfs /tmp:rw,nosuid,size=64m \
+            -v "$RUNNER_TEMP/omniroute:/src:ro" -w /src node:22-alpine \
+            node --experimental-strip-types --test /src/scripts/phase3/offline-chat.test.mjs \
+            | tee "$RUNNER_TEMP/phase3-tests.log"
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniroute-phase3-test-log
+          path: ${{ runner.temp }}/phase3-tests.log
+          if-no-files-found: ignore
+      - name: Scope gate
+        run: |
+          echo 'Source build and isolated route tests only. Full packaged-server acceptance remains pending.'

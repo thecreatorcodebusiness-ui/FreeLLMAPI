@@ -1,0 +1,218 @@
+diff --git a/bin/omniroute.mjs b/bin/omniroute.mjs
+index f046774d..afe872a2 100755
+--- a/bin/omniroute.mjs
++++ b/bin/omniroute.mjs
+@@ -314,7 +314,7 @@ if (shouldProvisionStorageKey(process.argv)) {
+ 
+ // Register update notifier — checks npm once per 24h, notifies on exit via stderr.
+ const _pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+-const _notifier = updateNotifier
++const _notifier = process.env.OMNIROUTE_STRICT_OFFLINE === "true" ? null : updateNotifier
+   ? updateNotifier({ pkg: _pkg, updateCheckInterval: 1000 * 60 * 60 * 24 })
+   : null;
+ process.on("exit", () => {
+diff --git a/scripts/phase3/offline-chat.test.mjs b/scripts/phase3/offline-chat.test.mjs
+new file mode 100644
+index 00000000..5f6328e5
+--- /dev/null
++++ b/scripts/phase3/offline-chat.test.mjs
+@@ -0,0 +1,75 @@
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import { test } from 'node:test';
++import { strictOfflineChat } from '../../src/lib/strictOffline.ts';
++
++const seen = [];
++const server = http.createServer(async (req, res) => {
++  const chunks = [];
++  for await (const chunk of req) chunks.push(chunk);
++  const body = JSON.parse(Buffer.concat(chunks).toString());
++  seen.push({ body, hop: req.headers['x-omniroute-hop'] });
++  const mode = body.messages[0].content;
++  if (mode === 'slow') return setTimeout(() => res.end('{}'), 1000);
++  if (mode === 'error') { res.writeHead(503, {'content-type':'application/json'}); return res.end('{"error":"mock"}'); }
++  if (mode === 'stream') {
++    res.writeHead(200, {'content-type':'text/event-stream'});
++    res.write('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
++    return res.end('data: [DONE]\n\n');
++  }
++  res.writeHead(200, {'content-type':'application/json'});
++  res.end(JSON.stringify({ choices:[{message: mode === 'tools' ? {tool_calls:[{id:'call-1',function:{name:'echo',arguments:'{}'}}]} : {content:'ok'}}] }));
++});
++await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
++const port = server.address().port;
++process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL = `http://127.0.0.1:${port}/v1/chat/completions`;
++process.env.OMNIROUTE_OFFLINE_MODEL = 'mock-free-model';
++process.env.OMNIROUTE_OFFLINE_CONNECTION_ID = 'mock-connection';
++process.env.OMNIROUTE_OFFLINE_HOP_ID = 'omni-test';
++process.env.OMNIROUTE_REQUEST_DEADLINE_MS = '200';
++const request = (mode, overrides = {}) => new Request('http://127.0.0.1/v1/chat/completions', {
++  method:'POST', headers:{'content-type':'application/json','x-omniroute-connection':'mock-connection',...(overrides.headers||{})},
++  body:JSON.stringify({model:'mock-free-model',messages:[{role:'user',content:mode}],...(overrides.body||{})}),
++  signal:overrides.signal,
++});
++try {
++  await test('normal, tools, SSE each dispatch once', async () => {
++    for (const mode of ['normal','tools','stream']) {
++      const before=seen.length, result=await strictOfflineChat(request(mode));
++      assert.equal(result.status,200);
++      const text=await result.text();
++      assert.match(text,mode==='stream' ? /\[DONE\]/ : mode==='tools' ? /call-1/ : /ok/);
++      assert.equal(seen.length,before+1);
++      assert.equal(seen.at(-1).hop,'omni-test');
++    }
++  });
++  await test('503 is passed through with one dispatch', async () => {
++    const before=seen.length, result=await strictOfflineChat(request('error'));
++    assert.equal(result.status,503); assert.equal(seen.length,before+1);
++  });
++  await test('deadline yields 504 with one dispatch', async () => {
++    const before=seen.length, start=Date.now(), result=await strictOfflineChat(request('slow'));
++    assert.equal(result.status,504); assert.ok(Date.now()-start<450);
++    assert.equal(seen.length,before+1);
++  });
++  await test('rejects model, connection, loop before dispatch', async () => {
++    const before=seen.length;
++    assert.equal((await strictOfflineChat(request('x',{body:{model:'unknown'}}))).status,400);
++    assert.equal((await strictOfflineChat(request('x',{headers:{'x-omniroute-connection':'unknown'}}))).status,403);
++    assert.equal((await strictOfflineChat(request('x',{headers:{'x-omniroute-hop':'omni-test'}}))).status,508);
++    assert.equal(seen.length,before);
++  });
++  await test('rejects external destination before dispatch', async () => {
++    const before=seen.length, original=process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL;
++    process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL='https://example.invalid/v1/chat/completions';
++    try { assert.equal((await strictOfflineChat(request('x'))).status,503); }
++    finally { process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL=original; }
++    assert.equal(seen.length,before);
++  });
++  await test('connection refusal fails without retry', async () => {
++    const original=process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL;
++    process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL='http://127.0.0.1:1/v1/chat/completions';
++    try { assert.equal((await strictOfflineChat(request('x'))).status,503); }
++    finally { process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL=original; }
++  });
++} finally { server.close(); }
+diff --git a/src/app/api/system/version/route.ts b/src/app/api/system/version/route.ts
+index 2794b8ac..d8c82617 100644
+--- a/src/app/api/system/version/route.ts
++++ b/src/app/api/system/version/route.ts
+@@ -67,6 +67,9 @@ async function getNews() {
+ }
+ 
+ export async function GET(req: NextRequest) {
++  if (process.env.OMNIROUTE_STRICT_OFFLINE === "true") {
++    return NextResponse.json({ current: getCurrentVersion(), latest: "offline", updateAvailable: false });
++  }
+   if (!(await isAuthenticated(req))) {
+     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+   }
+diff --git a/src/app/api/v1/chat/completions/route.ts b/src/app/api/v1/chat/completions/route.ts
+index ee8d9fbe..ec5ea438 100644
+--- a/src/app/api/v1/chat/completions/route.ts
++++ b/src/app/api/v1/chat/completions/route.ts
+@@ -45,6 +45,7 @@ import {
+   isCommonChatGptWebRetirementError,
+ } from "@/shared/constants/chatgptWebRetirement";
+ import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
++import { strictOfflineEnabled, strictOfflineChat } from "@/lib/strictOffline";
+ 
+ let initPromise = null;
+ 
+@@ -99,6 +100,11 @@ export async function OPTIONS() {
+ }
+ 
+ export async function POST(request) {
++  if (strictOfflineEnabled()) {
++    const authRejection = await enforceClientApiRouteAuth(request);
++    if (authRejection) return authRejection;
++    return strictOfflineChat(request);
++  }
+   await ensureInitialized();
+ 
+   // Defense-in-depth: the authz proxy (src/proxy.ts) is the primary gate, but
+diff --git a/src/lib/strictOffline.ts b/src/lib/strictOffline.ts
+new file mode 100644
+index 00000000..0516182e
+--- /dev/null
++++ b/src/lib/strictOffline.ts
+@@ -0,0 +1,67 @@
++/** Strict, single-dispatch fixture gateway. Normal routing never imports this path. */
++const enabled = () => process.env.OMNIROUTE_STRICT_OFFLINE === "true";
++
++export function strictOfflineEnabled(): boolean { return enabled(); }
++
++export async function strictOfflineChat(request: Request): Promise<Response> {
++  const started = Date.now();
++  const target = process.env.OMNIROUTE_OFFLINE_UPSTREAM_URL;
++  const model = process.env.OMNIROUTE_OFFLINE_MODEL;
++  const connection = process.env.OMNIROUTE_OFFLINE_CONNECTION_ID;
++  const ownHop = process.env.OMNIROUTE_OFFLINE_HOP_ID;
++  const deadline = Number(process.env.OMNIROUTE_REQUEST_DEADLINE_MS ?? "8000");
++  const fail = (status: number, code: string) => Response.json({ error: { code, message: code } }, { status });
++  let url: URL;
++  try { url = new URL(target ?? ""); } catch { return fail(503, "offline_configuration_invalid"); }
++  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port ||
++      url.pathname !== "/v1/chat/completions" || url.search || url.hash ||
++      !model || !connection || !ownHop || !/^[a-zA-Z0-9_-]{1,64}$/.test(ownHop) ||
++      !Number.isInteger(deadline) || deadline < 1 || deadline > 60000) {
++    return fail(503, "offline_configuration_invalid");
++  }
++  const incomingHop = request.headers.get("x-omniroute-hop");
++  if (incomingHop && (!/^[a-zA-Z0-9_-]{1,64}$/.test(incomingHop) || incomingHop === ownHop))
++    return fail(508, "routing_loop");
++  if (request.headers.get("x-omniroute-connection") !== connection)
++    return fail(403, "connection_not_allowed");
++  let body: Record<string, unknown>;
++  try {
++    const parsed: unknown = await request.json();
++    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw Error();
++    body = parsed as Record<string, unknown>;
++  } catch { return fail(400, "invalid_json"); }
++  if (body.model !== model || !Array.isArray(body.messages)) return fail(400, "model_not_allowed");
++  const remaining = deadline - (Date.now() - started);
++  if (remaining <= 0) return fail(504, "gateway_timeout");
++  const controller = new AbortController();
++  const onAbort = () => controller.abort(request.signal.reason);
++  request.signal.addEventListener("abort", onAbort, { once: true });
++  const timer = setTimeout(() => controller.abort(new Error("deadline")), remaining);
++  const cleanup = () => { clearTimeout(timer); request.signal.removeEventListener("abort", onAbort); };
++  try {
++    const response = await fetch(url, {
++      method: "POST", headers: { "content-type": "application/json", "x-omniroute-hop": ownHop },
++      body: JSON.stringify(body), signal: controller.signal, redirect: "error", cache: "no-store",
++    });
++    const headers = new Headers();
++    headers.set("content-type", response.headers.get("content-type") || "application/json");
++    headers.set("cache-control", "no-store");
++    if (!response.body) { cleanup(); return new Response(null, { status: response.status, headers }); }
++    const reader = response.body.getReader();
++    const stream = new ReadableStream<Uint8Array>({
++      async pull(out) {
++        try {
++          const chunk = await reader.read();
++          if (chunk.done) { cleanup(); out.close(); }
++          else out.enqueue(chunk.value);
++        } catch (error) { cleanup(); out.error(error); }
++      },
++      cancel(reason) { controller.abort(reason); cleanup(); void reader.cancel(reason); },
++    });
++    return new Response(stream, { status: response.status, headers });
++  } catch {
++    cleanup();
++    return fail(controller.signal.aborted && !request.signal.aborted ? 504 : 503,
++      controller.signal.aborted && !request.signal.aborted ? "gateway_timeout" : "upstream_unavailable");
++  }
++}
+diff --git a/src/sse/handlers/proxyJournal.ts b/src/sse/handlers/proxyJournal.ts
+index 248b4c5a..de1abf5f 100644
+--- a/src/sse/handlers/proxyJournal.ts
++++ b/src/sse/handlers/proxyJournal.ts
+@@ -75,7 +75,7 @@ async function resolveCachedEgress(proxy: unknown): Promise<string | null> {
+     const { proxyConfigToUrl } = await import("@omniroute/open-sse/utils/proxyDispatcher.ts");
+     const proxyUrl = proxy ? proxyConfigToUrl(proxy) : null;
+     const cached = getCachedEgressIp(proxyUrl);
+-    warmEgressIp(proxyUrl);
++    if (process.env.OMNIROUTE_STRICT_OFFLINE !== "true") warmEgressIp(proxyUrl);
+     return cached;
+   } catch {
+     // egress visibility is best-effort; never break the request path
