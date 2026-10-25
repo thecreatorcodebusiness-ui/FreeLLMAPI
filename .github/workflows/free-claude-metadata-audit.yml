@@ -67,11 +67,42 @@ jobs:
               print("MODEL",x["id"],"pricing",str(x["pricing_raw"])[:300],"other",x["price_related_fields"])
           print("AUDIT COMPLETE: metadata only. No inference or credentials.")
           PY
+      - name: Inspect xKiro public Claude model access tiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/provider-audit"
+          curl --fail --show-error --silent --location --max-time 20 --retry 1 \
+            --header 'Accept: application/json' \
+            'https://api.xkiro.com/v1/models' \
+            --output "$RUNNER_TEMP/provider-audit/xkiro-catalog.json"
+          python3 - "$RUNNER_TEMP/provider-audit/xkiro-catalog.json" "$RUNNER_TEMP/provider-audit/xkiro-results.json" <<'PY'
+          import json,sys,datetime
+          with open(sys.argv[1], encoding="utf-8") as f: payload=json.load(f)
+          items=payload.get("data",[]) if isinstance(payload,dict) else (payload if isinstance(payload,list) else [])
+          matches=[]
+          for m in items:
+              if not isinstance(m,dict): continue
+              mid=str(m.get("id",""))
+              if "claude" not in mid.lower() and "anthropic" not in mid.lower(): continue
+              tier=m.get("tier", m.get("access_tier",m.get("accessTier")))
+              pricing=m.get("pricing")
+              matches.append({"id":mid,"tier":tier,"pricing":pricing,"free_label_present":m.get("free"),"zero_cost_certified":False})
+          out={"checked_at_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               "provider":"xKiro","models_total":len(items),"claude_candidates":matches,
+               "inference_requests":0,
+               "note":"Model catalog only; requires account access and a free-tier eligibility check before any use."}
+          with open(sys.argv[2],"w",encoding="utf8") as f:json.dump(out,f,indent=2)
+          print("xKiro Claude candidates:",len(matches))
+          for x in matches:print("MODEL",x["id"],"tier",x["tier"],"pricing",x["pricing"])
+          PY
       - name: Publish metadata evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: free-claude-public-catalog
-          path: ${{ runner.temp }}/provider-audit/results.json
+          path: |
+            ${{ runner.temp }}/provider-audit/results.json
+            ${{ runner.temp }}/provider-audit/xkiro-results.json
           if-no-files-found: warn
           retention-days: 7
